@@ -2,7 +2,7 @@ import os
 import requests
 import time
 from datetime import timedelta
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 def share_post(token, link):
@@ -16,12 +16,19 @@ def share_post(token, link):
     }
 
     try:
-        response = requests.post(url, data=payload).json()
-        if 'id' in response:
-            return response['id']
-        return None  # Return None if the request failed
-    except requests.exceptions.RequestException:
-        return None  # Ignore network errors
+        response = requests.post(url, data=payload, timeout=8)
+        data = response.json()
+
+        # Debug errors for invalid tokens
+        if "error" in data:
+            err = data["error"].get("message", "")
+            print(f"⚠️ Token {token[:10]}... error: {err}")
+            return None
+
+        return data.get("id")
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Network issue: {e}")
+        return None
 
 def load_tokens(file_path):
     """Loads tokens from a file, one token per line."""
@@ -32,49 +39,50 @@ def load_tokens(file_path):
     with open(file_path, 'r') as f:
         return [line.strip() for line in f if line.strip()]
 
-def worker(tokens, link, token_index, success_list, lock, share_count):
-    """Worker function for sharing posts."""
-    while True:
-        with lock:
-            if len(success_list) >= share_count:
-                return  # Stop when target is reached
-
-        token = tokens[token_index % len(tokens)]  # Cycle through tokens
-        post_id = share_post(token, link)
-        if post_id:
-            with lock:
-                success_list.append(f"✅ Successfully Shared: {token[:8]}_{post_id} : {len(success_list) + 1}")
-                print(f"✅ Successfully Shared: {token[:8]}_{post_id} : {len(success_list)}")
-            return  # Stop only if the post was successfully shared
-        token_index += 1  # Move to the next token if the current one fails
+def worker(token, link):
+    """Single token worker that tries to share once."""
+    post_id = share_post(token, link)
+    if post_id:
+        return f"✅ {token[:8]} shared successfully ({post_id})"
+    return None
 
 def fast_share(tokens, link, share_count):
-    """Executes the sharing process using multiple threads."""
+    """Executes the sharing process using threads."""
     start_time = time.time()
-    print("🚀 Starting sharing process...")  
+    print("🚀 Starting sharing process...\n")
 
-    success_list = []  # List to track successful shares
-    lock = Lock()  # Lock to ensure thread safety
+    success = []
+    lock = Lock()
 
-    with ThreadPoolExecutor(max_workers=min(len(tokens), 70)) as executor:
-        futures = [executor.submit(worker, tokens, link, i, success_list, lock, share_count) for i in range(share_count)]
+    # Create limited thread pool — not 1 per share, that’s wasteful
+    with ThreadPoolExecutor(max_workers=min(len(tokens), 50)) as executor:
+        futures = []
 
-        # Ensure all tasks complete without getting stuck
-        for future in futures:
-            future.result()
-            if len(success_list) >= share_count:
-                break  # Stop as soon as the target is reached
+        # Loop until target shares reached or no valid tokens left
+        while len(success) < share_count:
+            for token in tokens:
+                if len(success) >= share_count:
+                    break
+                futures.append(executor.submit(worker, token, link))
 
-    elapsed_time = time.time() - start_time
-    avg_time_per_share = elapsed_time / share_count if share_count > 0 else 0
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    with lock:
+                        success.append(result)
+                        print(f"{len(success)}/{share_count} {result}")
+                if len(success) >= share_count:
+                    break
 
-    total_time = timedelta(seconds=int(elapsed_time))
-    avg_time = timedelta(seconds=int(avg_time_per_share))
+            # If all tokens failed, break out — avoid infinite loop
+            if all(f.result() is None for f in futures):
+                print("\n⚠️ All tokens failed or expired. Stopping.")
+                break
 
-    print(f"\n🚀 Target: {link}")
-    print(f"✅ Successfully Shared: {len(success_list)}/{share_count}")
-    print(f"⏳ Total Time: {total_time}")
-    print(f"⏱️ Average Time per Share: {avg_time}")
+    elapsed = timedelta(seconds=int(time.time() - start_time))
+    print(f"\n✅ Completed: {len(success)}/{share_count} successful shares")
+    print(f"⏳ Total Time: {elapsed}")
+    print(f"🚀 Target Link: {link}")
 
 def main():
     token_file = "/sdcard/Test/toka.txt"
@@ -100,4 +108,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-   
